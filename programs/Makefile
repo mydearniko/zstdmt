@@ -3,6 +3,8 @@
 # /TR 2024-02-02
 ##############################################################################
 
+UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
+
 # current versions we're using (tagged in their main repo)
 BRO_VER	= "v1.1.0"
 LIZ_VER	= "v1.0"
@@ -42,6 +44,11 @@ CFLAGS	+= -O3
 #CFLAGS += -march=native
 LDFLAGS	= $(WIN_LDFLAGS) -lpthread
 
+ifeq ($(UNAME_S),Darwin)
+SFLAGS	= -x
+LDFLAGS	= $(WIN_LDFLAGS)
+endif
+
 PRGS	= lizard-mt$(EXTENSION) \
 	  lz4-mt$(EXTENSION) \
 	  lz5-mt$(EXTENSION) \
@@ -51,7 +58,7 @@ PRGS	= lizard-mt$(EXTENSION) \
 	  lzfse-mt$(EXTENSION)
 
 all:	loadsource $(PRGS)
-again:	clean $(PRGS)
+again:	clean loadsource $(PRGS)
 
 ZSTDMTDIR = ../lib
 COMMON	= platform.c $(ZSTDMTDIR)/threading.c

@@ -18,6 +18,7 @@
 
 #include "brotli-mt.h"
 #include "memmt.h"
+#include "jobcontrol.h"
 #include "threading.h"
 #include "list.h"
 
@@ -48,6 +49,8 @@ struct writelist {
 	struct list_head node;
 };
 
+static void *pt_decompress(void *arg);
+
 struct BROTLIMT_DCtx_s {
 
 	/* threads: 1..BROTLIMT_THREAD_MAX */
@@ -75,7 +78,11 @@ struct BROTLIMT_DCtx_s {
 	fn_write *fn_write;
 	void *arg_write;
 
+	/* worker lifecycle */
+	MT_JobControl job;
+
 	/* lists for writing queue */
+	struct writelist *writelist;
 	struct list_head writelist_free;
 	struct list_head writelist_busy;
 	struct list_head writelist_done;
@@ -89,15 +96,16 @@ BROTLIMT_DCtx *BROTLIMT_createDCtx(int threads, int inputsize)
 {
 	BROTLIMT_DCtx *ctx;
 	int t;
+	int started = 0;
 
 	/* allocate ctx */
-	ctx = (BROTLIMT_DCtx *) malloc(sizeof(BROTLIMT_DCtx));
+	ctx = (BROTLIMT_DCtx *) calloc(1, sizeof(BROTLIMT_DCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
 	if (threads < 1 || threads > BROTLIMT_THREAD_MAX)
-		return 0;
+		goto err_job;
 
 	/* setup ctx */
 	ctx->threads = threads;
@@ -114,6 +122,7 @@ BROTLIMT_DCtx *BROTLIMT_createDCtx(int threads, int inputsize)
 
 	pthread_mutex_init(&ctx->read_mutex, NULL);
 	pthread_mutex_init(&ctx->write_mutex, NULL);
+	MTJobControl_init(&ctx->job);
 
 	INIT_LIST_HEAD(&ctx->writelist_free);
 	INIT_LIST_HEAD(&ctx->writelist_busy);
@@ -121,18 +130,50 @@ BROTLIMT_DCtx *BROTLIMT_createDCtx(int threads, int inputsize)
 
 	ctx->cwork = (cwork_t *) malloc(sizeof(cwork_t) * threads);
 	if (!ctx->cwork)
-		goto err_cwork;
+		goto err_job;
 
 	for (t = 0; t < threads; t++) {
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
+		w->in.buf = 0;
+		w->in.size = 0;
+		w->in.allocated = 0;
+	}
+
+	ctx->writelist =
+	    (struct writelist *)calloc((size_t)threads, sizeof(struct writelist));
+	if (!ctx->writelist)
+		goto err_cwork;
+
+	for (t = 0; t < ctx->threads; t++) {
+		struct writelist *wl = &ctx->writelist[t];
+		wl->out.buf = 0;
+		wl->out.size = 0;
+		wl->out.allocated = 0;
+		list_add_tail(&wl->node, &ctx->writelist_free);
+	}
+
+	for (t = 0; t < ctx->threads; t++) {
+		cwork_t *w = &ctx->cwork[t];
+		if (pthread_create(&w->pthread, NULL, pt_decompress, w) != 0)
+			goto err_threads;
+		started++;
 	}
 
 	return ctx;
 
+ err_threads:
+	MTJobControl_shutdown(&ctx->job);
+	while (started-- > 0)
+		pthread_join(ctx->cwork[started].pthread, NULL);
+	free(ctx->writelist);
  err_cwork:
+	free(ctx->cwork);
+ err_job:
+	MTJobControl_destroy(&ctx->job);
+	pthread_mutex_destroy(&ctx->write_mutex);
+	pthread_mutex_destroy(&ctx->read_mutex);
 	free(ctx);
-
 	return 0;
 }
 
@@ -174,11 +215,27 @@ static size_t pt_write(BROTLIMT_DCtx * ctx, struct writelist *wl)
 			ctx->outsize += wl->out.size;
 			ctx->curframe++;
 			list_move(entry, &ctx->writelist_free);
+			pthread_cond_signal(&ctx->job.free_cond);
 			goto again;
 		}
 	}
 
 	return 0;
+}
+
+static void reset_writelists(BROTLIMT_DCtx *ctx)
+{
+	pthread_mutex_lock(&ctx->write_mutex);
+	while (!list_empty(&ctx->writelist_busy)) {
+		struct list_head *entry = list_first(&ctx->writelist_busy);
+		list_move(entry, &ctx->writelist_free);
+	}
+	while (!list_empty(&ctx->writelist_done)) {
+		struct list_head *entry = list_first(&ctx->writelist_done);
+		list_move(entry, &ctx->writelist_free);
+	}
+	pthread_cond_broadcast(&ctx->job.free_cond);
+	pthread_mutex_unlock(&ctx->write_mutex);
 }
 
 /**
@@ -288,101 +345,105 @@ static void *pt_decompress(void *arg)
 	cwork_t *w = (cwork_t *) arg;
 	BROTLIMT_Buffer *in = &w->in;
 	BROTLIMT_DCtx *ctx = w->ctx;
-	size_t result = 0;
-	struct writelist *wl;
+	unsigned generation = 0;
 
-	for (;;) {
-		struct list_head *entry;
-		BROTLIMT_Buffer *out;
-		int rv;
+	while (MTJobControl_wait(&ctx->job, &generation)) {
+		size_t result = 0;
+		struct writelist *wl = 0;
+		int failed = 0;
 
-		/* allocate space for new output */
-		pthread_mutex_lock(&ctx->write_mutex);
-		if (!list_empty(&ctx->writelist_free)) {
-			/* take unused entry */
+		for (;;) {
+			struct list_head *entry;
+			BROTLIMT_Buffer *out;
+			int rv;
+
+			if (MTJobControl_should_stop(&ctx->job))
+				break;
+
+			pthread_mutex_lock(&ctx->write_mutex);
+			while (list_empty(&ctx->writelist_free)
+			       && !MTJobControl_should_stop(&ctx->job))
+				pthread_cond_wait(&ctx->job.free_cond,
+						  &ctx->write_mutex);
+			if (list_empty(&ctx->writelist_free)
+			    && MTJobControl_should_stop(&ctx->job)) {
+				pthread_mutex_unlock(&ctx->write_mutex);
+				break;
+			}
 			entry = list_first(&ctx->writelist_free);
 			wl = list_entry(entry, struct writelist, node);
 			list_move(entry, &ctx->writelist_busy);
-		} else {
-			/* allocate new one */
-			wl = (struct writelist *)
-			    malloc(sizeof(struct writelist));
-			if (!wl) {
-				result = MT_ERROR(memory_allocation);
-				goto error_unlock;
+			pthread_mutex_unlock(&ctx->write_mutex);
+			out = &wl->out;
+
+			result = pt_read(ctx, in, &wl->frame, &out->size);
+			if (BROTLIMT_isError(result)) {
+				failed = 1;
+				break;
 			}
-			wl->out.buf = 0;
-			wl->out.size = 0;
-			wl->out.allocated = 0;
-			list_add(&wl->node, &ctx->writelist_busy);
-		}
-		pthread_mutex_unlock(&ctx->write_mutex);
-		out = &wl->out;
 
-		/* zero should not happen here! */
-		result = pt_read(ctx, in, &wl->frame, &wl->out.size);
-		if (BROTLIMT_isError(result)) {
-			list_move(&wl->node, &ctx->writelist_free);
-			goto error_lock;
-		}
-
-		if (in->size == 0)
-			break;
-
-		if (out->allocated < out->size) {
-			if (out->allocated)
-				out->buf = realloc(out->buf, out->size);
-			else
-				out->buf = malloc(out->size);
-			if (!out->buf) {
-				result = MT_ERROR(memory_allocation);
-				goto error_lock;
+			if (in->size == 0) {
+				pthread_mutex_lock(&ctx->write_mutex);
+				list_move(&wl->node, &ctx->writelist_free);
+				pthread_cond_signal(&ctx->job.free_cond);
+				pthread_mutex_unlock(&ctx->write_mutex);
+				wl = 0;
+				break;
 			}
-			out->allocated = out->size;
+
+			if (out->allocated < out->size) {
+				void *buf = realloc(out->buf, out->size);
+				if (!buf) {
+					result = MT_ERROR(memory_allocation);
+					failed = 1;
+					break;
+				}
+				out->buf = buf;
+				out->allocated = out->size;
+			}
+
+			rv =
+			    BrotliDecoderDecompress(in->size, in->buf,
+						    &out->size, out->buf);
+
+			if (rv != BROTLI_DECODER_RESULT_SUCCESS) {
+				result = MT_ERROR(frame_decompress);
+				failed = 1;
+				break;
+			}
+
+			pthread_mutex_lock(&ctx->write_mutex);
+			result = pt_write(ctx, wl);
+			pthread_mutex_unlock(&ctx->write_mutex);
+			wl = 0;
+			if (BROTLIMT_isError(result)) {
+				failed = 1;
+				break;
+			}
 		}
 
-		rv =
-		    BrotliDecoderDecompress(in->size, in->buf, &out->size,
-					    out->buf);
-
-		if (rv != BROTLI_DECODER_RESULT_SUCCESS) {
-			result = MT_ERROR(frame_decompress);
-			goto error_lock;
+		if (failed) {
+			if (wl) {
+				pthread_mutex_lock(&ctx->write_mutex);
+				list_move(&wl->node, &ctx->writelist_free);
+				pthread_cond_signal(&ctx->job.free_cond);
+				pthread_mutex_unlock(&ctx->write_mutex);
+			}
+			MTJobControl_set_result(&ctx->job, result);
 		}
-
-		/* write result */
-		pthread_mutex_lock(&ctx->write_mutex);
-		result = pt_write(ctx, wl);
-		if (BROTLIMT_isError(result))
-			goto error_unlock;
-		pthread_mutex_unlock(&ctx->write_mutex);
+		MTJobControl_finish_worker(&ctx->job);
 	}
 
-	/* everything is okay */
-	pthread_mutex_lock(&ctx->write_mutex);
-	list_move(&wl->node, &ctx->writelist_free);
-	pthread_mutex_unlock(&ctx->write_mutex);
-	if (in->allocated)
-		free(in->buf);
 	return 0;
-
- error_lock:
-	pthread_mutex_lock(&ctx->write_mutex);
- error_unlock:
-	list_move(&wl->node, &ctx->writelist_free);
-	pthread_mutex_unlock(&ctx->write_mutex);
-	if (in->allocated)
-		free(in->buf);
-	return (void *)result;
 }
 
 size_t BROTLIMT_decompressDCtx(BROTLIMT_DCtx * ctx, BROTLIMT_RdWr_t * rdwr)
 {
 	unsigned char buf[4];
-	int t, rv;
+	int rv;
 	cwork_t *w = &ctx->cwork[0];
 	BROTLIMT_Buffer *in = &w->in;
-	void *retval_of_thread = 0;
+	size_t result;
 
 	if (!ctx)
 		return MT_ERROR(compressionParameter_unsupported);
@@ -392,6 +453,10 @@ size_t BROTLIMT_decompressDCtx(BROTLIMT_DCtx * ctx, BROTLIMT_RdWr_t * rdwr)
 	ctx->fn_write = rdwr->fn_write;
 	ctx->arg_read = rdwr->arg_read;
 	ctx->arg_write = rdwr->arg_write;
+	ctx->insize = 0;
+	ctx->outsize = 0;
+	ctx->frames = 0;
+	ctx->curframe = 0;
 
 	/* check for BROTLIMT_MAGIC_SKIPPABLE */
 	in->buf = buf;
@@ -406,51 +471,14 @@ size_t BROTLIMT_decompressDCtx(BROTLIMT_DCtx * ctx, BROTLIMT_RdWr_t * rdwr)
 	if (MEM_readLE32(buf) != BROTLIMT_MAGIC_SKIPPABLE)
 		return MT_ERROR(data_error);
 
-	/* mark unused */
 	in->buf = 0;
 	in->size = 0;
-	in->allocated = 0;
 
-	/* single threaded, but with known sizes */
-	if (ctx->threads == 1) {
-		/* no pthread_create() needed! */
-		void *p = pt_decompress(w);
-		if (p)
-			return (size_t) p;
-		goto okay;
-	}
+	MTJobControl_start(&ctx->job, ctx->threads);
+	result = MTJobControl_wait_done(&ctx->job);
+	reset_writelists(ctx);
 
-	/* multi threaded */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *wt = &ctx->cwork[t];
-		wt->in.buf = 0;
-		wt->in.size = 0;
-		wt->in.allocated = 0;
-		pthread_create(&wt->pthread, NULL, pt_decompress, wt);
-	}
-
-	/* wait for all workers */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *wt = &ctx->cwork[t];
-		void *p = 0;
-		pthread_join(wt->pthread, &p);
-		if (p)
-			retval_of_thread = p;
-	}
-
- okay:
-	/* clean up the buffers */
-	while (!list_empty(&ctx->writelist_free)) {
-		struct writelist *wl;
-		struct list_head *entry;
-		entry = list_first(&ctx->writelist_free);
-		wl = list_entry(entry, struct writelist, node);
-		free(wl->out.buf);
-		list_del(&wl->node);
-		free(wl);
-	}
-
-	return (size_t) retval_of_thread;
+	return result;
 }
 
 /* returns current uncompressed data size */
@@ -482,14 +510,22 @@ size_t BROTLIMT_GetFramesDCtx(BROTLIMT_DCtx * ctx)
 
 void BROTLIMT_freeDCtx(BROTLIMT_DCtx * ctx)
 {
+	int t;
+
 	if (!ctx)
 		return;
 
+	MTJobControl_shutdown(&ctx->job);
+	for (t = 0; t < ctx->threads; t++)
+		pthread_join(ctx->cwork[t].pthread, NULL);
+	for (t = 0; t < ctx->threads; t++)
+		free(ctx->cwork[t].in.buf);
+	for (t = 0; t < ctx->threads; t++)
+		free(ctx->writelist[t].out.buf);
+	free(ctx->writelist);
+	MTJobControl_destroy(&ctx->job);
 	pthread_mutex_destroy(&ctx->read_mutex);
 	pthread_mutex_destroy(&ctx->write_mutex);
 	free(ctx->cwork);
 	free(ctx);
-	ctx = 0;
-
-	return;
 }

@@ -2,6 +2,7 @@
 #include "snappy-mt.h"
 
 #include "memmt.h"
+#include "jobcontrol.h"
 #include "threading.h"
 #include "list.h"
 
@@ -36,6 +37,8 @@ struct writelist {
 	struct list_head node;
 };
 
+static void *pt_compress(void *arg);
+
 
 struct SNAPPYMT_CCtx_s {
 
@@ -67,7 +70,11 @@ struct SNAPPYMT_CCtx_s {
 	fnWrite *fn_write;
 	void *arg_write;
 
+	/* worker lifecycle */
+	MT_JobControl job;
+
 	/* lists for writing queue */
+	struct writelist *writelist;
 	struct list_head writelist_free;
 	struct list_head writelist_busy;
 	struct list_head writelist_done;
@@ -82,15 +89,16 @@ SNAPPYMT_CCtx *SNAPPYMT_createCCtx(int threads, __attribute__((unused)) int leve
 {
 	SNAPPYMT_CCtx *ctx;
 	int t;
+	int started = 0;
 
 	/* allocate ctx */
-	ctx = (SNAPPYMT_CCtx *) malloc(sizeof(SNAPPYMT_CCtx));
+	ctx = (SNAPPYMT_CCtx *) calloc(1, sizeof(SNAPPYMT_CCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
 	if (threads < 1 || threads > SNAPPYMT_THREAD_MAX)
-		return 0;
+		goto err_job;
 
 	/* check level */
 	/* None level */
@@ -111,6 +119,7 @@ SNAPPYMT_CCtx *SNAPPYMT_createCCtx(int threads, __attribute__((unused)) int leve
 
 	pthread_mutex_init(&ctx->read_mutex, NULL);
 	pthread_mutex_init(&ctx->write_mutex, NULL);
+	MTJobControl_init(&ctx->job);
 
 	/* free -> busy -> out -> free -> ... */
 	INIT_LIST_HEAD(&ctx->writelist_free);	/* free, can be used */
@@ -119,17 +128,51 @@ SNAPPYMT_CCtx *SNAPPYMT_createCCtx(int threads, __attribute__((unused)) int leve
 
 	ctx->cwork = (cwork_t *) malloc(sizeof(cwork_t) * threads);
 	if (!ctx->cwork)
-		goto err_cwork;
+		goto err_job;
 
 	for (t = 0; t < threads; t++) {
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
+		if (snappy_init_env(&w->zpref) != 0)
+			goto err_env;
 
+	}
+
+	ctx->writelist =
+	    (struct writelist *)calloc((size_t)threads, sizeof(struct writelist));
+	if (!ctx->writelist)
+		goto err_env;
+
+	for (t = 0; t < ctx->threads; t++) {
+		struct writelist *wl = &ctx->writelist[t];
+		wl->out.buf = 0;
+		wl->out.size = 0;
+		wl->out.allocated = 0;
+		list_add_tail(&wl->node, &ctx->writelist_free);
+	}
+
+	for (t = 0; t < ctx->threads; t++) {
+		cwork_t *w = &ctx->cwork[t];
+		if (pthread_create(&w->pthread, NULL, pt_compress, w) != 0)
+			goto err_threads;
+		started++;
 	}
 
 	return ctx;
 
- err_cwork:
+ err_threads:
+	MTJobControl_shutdown(&ctx->job);
+	while (started-- > 0)
+		pthread_join(ctx->cwork[started].pthread, NULL);
+	free(ctx->writelist);
+ err_env:
+	while (t-- > 0)
+		snappy_free_env(&ctx->cwork[t].zpref);
+	free(ctx->cwork);
+ err_job:
+	MTJobControl_destroy(&ctx->job);
+	pthread_mutex_destroy(&ctx->write_mutex);
+	pthread_mutex_destroy(&ctx->read_mutex);
 	free(ctx);
 
 	return NULL;
@@ -177,11 +220,27 @@ static size_t pt_write(SNAPPYMT_CCtx *ctx, struct writelist *wl)
 			ctx->outsize += wl->out.size;
 			ctx->curframe++;
 			list_move(entry, &ctx->writelist_free);
+			pthread_cond_signal(&ctx->job.free_cond);
 			goto again;
 		}
 	}
 
 	return 0;
+}
+
+static void reset_writelists(SNAPPYMT_CCtx *ctx)
+{
+	pthread_mutex_lock(&ctx->write_mutex);
+	while (!list_empty(&ctx->writelist_busy)) {
+		struct list_head *entry = list_first(&ctx->writelist_busy);
+		list_move(entry, &ctx->writelist_free);
+	}
+	while (!list_empty(&ctx->writelist_done)) {
+		struct list_head *entry = list_first(&ctx->writelist_done);
+		list_move(entry, &ctx->writelist_free);
+	}
+	pthread_cond_broadcast(&ctx->job.free_cond);
+	pthread_mutex_unlock(&ctx->write_mutex);
 }
 
 static void *pt_compress(void *arg)
@@ -190,132 +249,147 @@ static void *pt_compress(void *arg)
 	SNAPPYMT_CCtx *ctx = w->ctx;
 	size_t result;
 	SNAPPYMT_Buffer in;
+	unsigned generation = 0;
+	const size_t max_out =
+	    snappy_max_compressed_length((size_t)ctx->inputsize) + 16;
 
 	/* inbuf is constant */
 	in.size = ctx->inputsize;
 	in.buf = malloc(in.size);
-	if (!in.buf)
-		return (void *)MT_ERROR(memory_allocation);
+	if (!in.buf) {
+		MTJobControl_set_result(&ctx->job,
+					MT_ERROR(memory_allocation));
+		return 0;
+	}
 
-	for (;;) {
+	while (MTJobControl_wait(&ctx->job, &generation)) {
 		struct list_head *entry;
 		struct writelist *wl;
 		int rv;
+		int failed = 0;
 
-		/* allocate space for new output */
-		pthread_mutex_lock(&ctx->write_mutex);
-		if (!list_empty(&ctx->writelist_free)) {
-			/* take unused entry */
-			entry = list_first(&ctx->writelist_free);
-			wl = list_entry(entry, struct writelist, node);
-			wl->out.size =
-			    snappy_max_compressed_length((size_t)(ctx->inputsize)) + 16;
-			list_move(entry, &ctx->writelist_busy);
-		} else {
-			/* allocate new one */
-			wl = (struct writelist *)
-			    malloc(sizeof(struct writelist));
-			if (!wl) {
-				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)MT_ERROR(memory_allocation);
-			}
-			wl->out.size =
-			    snappy_max_compressed_length((size_t)(ctx->inputsize)) + 16;
-			wl->out.buf = malloc(wl->out.size);
-			if (!wl->out.buf) {
-				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)MT_ERROR(memory_allocation);
-			}
-			list_add(&wl->node, &ctx->writelist_busy);
-		}
-		pthread_mutex_unlock(&ctx->write_mutex);
-
-		/* read new input */
-		pthread_mutex_lock(&ctx->read_mutex);
-		in.size = ctx->inputsize;
-		rv = ctx->fn_read(ctx->arg_read, &in);
-		if (rv != 0) {
-			pthread_mutex_unlock(&ctx->read_mutex);
-			return (void *)mt_error(rv);
-		}
-
-		/* eof */
-		if (in.size == 0 && ctx->frames > 0) {
-			free(in.buf);
-			pthread_mutex_unlock(&ctx->read_mutex);
+		for (;;) {
+			if (MTJobControl_should_stop(&ctx->job))
+				break;
 
 			pthread_mutex_lock(&ctx->write_mutex);
-			list_move(&wl->node, &ctx->writelist_free);
+			while (list_empty(&ctx->writelist_free)
+			       && !MTJobControl_should_stop(&ctx->job))
+				pthread_cond_wait(&ctx->job.free_cond,
+						  &ctx->write_mutex);
+			if (list_empty(&ctx->writelist_free)
+			    && MTJobControl_should_stop(&ctx->job)) {
+				pthread_mutex_unlock(&ctx->write_mutex);
+				break;
+			}
+			entry = list_first(&ctx->writelist_free);
+			wl = list_entry(entry, struct writelist, node);
+			list_move(entry, &ctx->writelist_busy);
 			pthread_mutex_unlock(&ctx->write_mutex);
 
-			goto okay;
-		}
-		ctx->insize += in.size;
-		wl->frame = ctx->frames++;
-		pthread_mutex_unlock(&ctx->read_mutex);
+			if (wl->out.allocated < max_out) {
+				void *buf = realloc(wl->out.buf, max_out);
+				if (!buf) {
+					result = MT_ERROR(memory_allocation);
+					failed = 1;
+					break;
+				}
+				wl->out.buf = buf;
+				wl->out.allocated = max_out;
+			}
+			wl->out.size = max_out;
 
-		/* compress whole frame */
-		{
-			const char *ibuf = (char *)(in.buf);
-			char *obuf = (char *)(wl->out.buf) + 16;
-			wl->out.size -= 16;
+			/* read new input */
+			pthread_mutex_lock(&ctx->read_mutex);
+			in.size = ctx->inputsize;
+			rv = ctx->fn_read(ctx->arg_read, &in);
+			if (rv != 0) {
+				pthread_mutex_unlock(&ctx->read_mutex);
+				result = mt_error(rv);
+				failed = 1;
+				break;
+			}
 
+			/* eof */
+			if (in.size == 0 && ctx->frames > 0) {
+				pthread_mutex_unlock(&ctx->read_mutex);
 
-			struct snappy_env env;
-			snappy_init_env(&env);
-			rv = snappy_compress(&(env), ibuf, in.size, obuf, &wl->out.size);
-
-			/* printf("snappy_compress() rv=%d in=%zu out=%zu\n", rv, in.size, wl->out.size); */
-
-			if (rv != SNAPPY_OK) {
 				pthread_mutex_lock(&ctx->write_mutex);
 				list_move(&wl->node, &ctx->writelist_free);
+				pthread_cond_signal(&ctx->job.free_cond);
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)MT_ERROR(frame_compress);
+				break;
 			}
-			snappy_free_env(&(env));
+			ctx->insize += in.size;
+			wl->frame = ctx->frames++;
+			pthread_mutex_unlock(&ctx->read_mutex);
+
+			/* compress whole frame */
+			{
+				const char *ibuf = (char *)(in.buf);
+				char *obuf = (char *)(wl->out.buf) + 16;
+				wl->out.size -= 16;
+
+				rv =
+				    snappy_compress(&w->zpref, ibuf, in.size,
+						    obuf, &wl->out.size);
+				if (rv != SNAPPY_OK) {
+					result = MT_ERROR(frame_compress);
+					failed = 1;
+					break;
+				}
+			}
+
+			/* write skippable frame */
+			MEM_writeLE32((unsigned char *)wl->out.buf + 0,
+				      SNAPPYMT_MAGIC_SKIPPABLE);
+			MEM_writeLE32((unsigned char *)wl->out.buf + 4, 8);
+			MEM_writeLE32((unsigned char *)wl->out.buf + 8,
+				      (U32) wl->out.size);
+			MEM_writeLE16((unsigned char *)wl->out.buf + 12,
+				      (U16) SNAPPYMT_MAGICNUMBER);
+
+			/* number of 64KB blocks needed for decompression */
+			{
+			U16 hintsize;
+			if (ctx->inputsize > (int)in.size) {
+				hintsize = (U16)(in.size >> 16);
+				hintsize += 1;
+			} else
+				hintsize = ctx->inputsize >> 16;
+			MEM_writeLE16((unsigned char *)wl->out.buf + 14,
+				      hintsize);
+			}
+
+			wl->out.size += 16;
+
+			/* write result */
+			pthread_mutex_lock(&ctx->write_mutex);
+			result = pt_write(ctx, wl);
+			pthread_mutex_unlock(&ctx->write_mutex);
+			if (SNAPPYMT_isError(result)) {
+				failed = 1;
+				break;
+			}
 		}
 
-		/* write skippable frame */
-		MEM_writeLE32((unsigned char *)wl->out.buf + 0,
-			      SNAPPYMT_MAGIC_SKIPPABLE);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 8);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 8,
-			      (U32) wl->out.size);
-		/* BR */
-		MEM_writeLE16((unsigned char *)wl->out.buf + 12,
-			      (U16) SNAPPYMT_MAGICNUMBER);
-
-		/* number of 64KB blocks needed for decompression */
-		{
-		U16 hintsize;
-		if (ctx->inputsize > (int)in.size) {
-			hintsize = (U16)(in.size >> 16);
-			hintsize += 1;
-		} else
-			hintsize = ctx->inputsize >> 16;
-		MEM_writeLE16((unsigned char *)wl->out.buf + 14,
-			      hintsize);
+		if (failed) {
+			pthread_mutex_lock(&ctx->write_mutex);
+			list_move(&wl->node, &ctx->writelist_free);
+			pthread_cond_signal(&ctx->job.free_cond);
+			pthread_mutex_unlock(&ctx->write_mutex);
+			MTJobControl_set_result(&ctx->job, result);
 		}
-
-		wl->out.size += 16;
-
-		/* write result */
-		pthread_mutex_lock(&ctx->write_mutex);
-		result = pt_write(ctx, wl);
-		pthread_mutex_unlock(&ctx->write_mutex);
-		if (SNAPPYMT_isError(result))
-			return (void *)result;
+		MTJobControl_finish_worker(&ctx->job);
 	}
 
- okay:
+	free(in.buf);
 	return 0;
 }
 
 size_t SNAPPYMT_compressCCtx(SNAPPYMT_CCtx *ctx, SNAPPYMT_RdWr_t *rdwr)
 {
-	int t;
-	void *retval_of_thread = 0;
+	size_t result;
 
 	if (!ctx)
 		return MT_ERROR(compressionParameter_unsupported);
@@ -325,34 +399,16 @@ size_t SNAPPYMT_compressCCtx(SNAPPYMT_CCtx *ctx, SNAPPYMT_RdWr_t *rdwr)
 	ctx->fn_write = rdwr->fn_write;
 	ctx->arg_read = rdwr->arg_read;
 	ctx->arg_write = rdwr->arg_write;
+	ctx->insize = 0;
+	ctx->outsize = 0;
+	ctx->frames = 0;
+	ctx->curframe = 0;
 
-	/* start all workers */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *w = &ctx->cwork[t];
-		pthread_create(&w->pthread, NULL, pt_compress, w);
-	}
+	MTJobControl_start(&ctx->job, ctx->threads);
+	result = MTJobControl_wait_done(&ctx->job);
+	reset_writelists(ctx);
 
-	/* wait for all workers */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *w = &ctx->cwork[t];
-		void *p = 0;
-		pthread_join(w->pthread, &p);
-		if (p)
-			retval_of_thread = p;
-	}
-
-	/* clean up lists */
-	while (!list_empty(&ctx->writelist_free)) {
-		struct writelist *wl;
-		struct list_head *entry;
-		entry = list_first(&ctx->writelist_free);
-		wl = list_entry(entry, struct writelist, node);
-		free(wl->out.buf);
-		list_del(&wl->node);
-		free(wl);
-	}
-
-	return (size_t) retval_of_thread;
+	return result;
 }
 
 /* returns current uncompressed data size */
@@ -384,9 +440,20 @@ size_t SNAPPYMT_GetFramesCCtx(SNAPPYMT_CCtx * ctx)
 
 void SNAPPYMT_freeCCtx(SNAPPYMT_CCtx * ctx)
 {
+	int t;
+
 	if (!ctx)
 		return;
 
+	MTJobControl_shutdown(&ctx->job);
+	for (t = 0; t < ctx->threads; t++)
+		pthread_join(ctx->cwork[t].pthread, NULL);
+	for (t = 0; t < ctx->threads; t++) {
+		free(ctx->writelist[t].out.buf);
+		snappy_free_env(&ctx->cwork[t].zpref);
+	}
+	free(ctx->writelist);
+	MTJobControl_destroy(&ctx->job);
 	pthread_mutex_destroy(&ctx->read_mutex);
 	pthread_mutex_destroy(&ctx->write_mutex);
 	free(ctx->cwork);

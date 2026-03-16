@@ -184,7 +184,13 @@ static int ReadData(void *arg, MT_Buffer * in)
 static int WriteData(void *arg, MT_Buffer * out)
 {
 	FILE *fd = (FILE *) arg;
-	ssize_t done = fwrite(out->buf, 1, out->size, fd);
+	size_t done;
+
+	if (opt_mode == MODE_LIST || opt_mode == MODE_TEST) {
+		done = out->size;
+	} else {
+		done = fwrite(out->buf, 1, out->size, fd);
+	}
 
 	/* generate crc32 of uncompressed file */
 	if (opt_mode == MODE_LIST && opt_verbose > 1)
@@ -980,4 +986,3 @@ int main(int argc, char **argv)
 	/* exit should flush stdout / stderr */
 	exit(exit_code);
 }
-

@@ -37,6 +37,14 @@ extern "C" {
 #define pthread_mutex_lock        EnterCriticalSection
 #define pthread_mutex_unlock      LeaveCriticalSection
 
+/* condition variables */
+#define pthread_cond_t CONDITION_VARIABLE
+#define pthread_cond_init(a,b)    (InitializeConditionVariable((a)), 0)
+#define pthread_cond_destroy(a)   ((void)0)
+#define pthread_cond_signal       WakeConditionVariable
+#define pthread_cond_broadcast    WakeAllConditionVariable
+#define pthread_cond_wait(a,b)    (SleepConditionVariableCS((a), (b), INFINITE) ? 0 : -1)
+
 /* pthread_create() and pthread_join() */
 typedef struct {
 	HANDLE handle;

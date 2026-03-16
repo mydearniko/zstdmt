@@ -18,6 +18,7 @@
 #include "zstd.h"
 
 #include "memmt.h"
+#include "jobcontrol.h"
 #include "threading.h"
 #include "list.h"
 #include "zstd-mt.h"
@@ -46,6 +47,8 @@ struct writelist {
 	ZSTDCB_Buffer out;
 	struct list_head node;
 };
+
+static void *pt_compress(void *arg);
 
 struct ZSTDCB_CCtx_s {
 
@@ -81,7 +84,11 @@ struct ZSTDCB_CCtx_s {
 	pthread_mutex_t error_mutex;
 	size_t zstdmt_errcode;
 
+	/* worker lifecycle */
+	MT_JobControl job;
+
 	/* lists for writing queue */
+	struct writelist *writelist;
 	struct list_head writelist_free;
 	struct list_head writelist_busy;
 	struct list_head writelist_done;
@@ -95,19 +102,20 @@ ZSTDCB_CCtx *ZSTDCB_createCCtx(int threads, int level, int inputsize)
 {
 	ZSTDCB_CCtx *ctx;
 	int t;
+	int started = 0;
 
 	/* allocate ctx */
-	ctx = (ZSTDCB_CCtx *) malloc(sizeof(ZSTDCB_CCtx));
+	ctx = (ZSTDCB_CCtx *) calloc(1, sizeof(ZSTDCB_CCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
 	if (threads < 1 || threads > ZSTDCB_THREAD_MAX)
-		goto err_ctx;
+		goto err_job;
 
 	/* check level */
 	if (level < ZSTDCB_LEVEL_MIN || level > ZSTDCB_LEVEL_MAX)
-		goto err_ctx;
+		goto err_job;
 
 
 
@@ -133,6 +141,7 @@ ZSTDCB_CCtx *ZSTDCB_createCCtx(int threads, int level, int inputsize)
 	pthread_mutex_init(&ctx->read_mutex, NULL);
 	pthread_mutex_init(&ctx->write_mutex, NULL);
 	pthread_mutex_init(&ctx->error_mutex, NULL);
+	MTJobControl_init(&ctx->job);
 
 	INIT_LIST_HEAD(&ctx->writelist_free);
 	INIT_LIST_HEAD(&ctx->writelist_busy);
@@ -140,16 +149,47 @@ ZSTDCB_CCtx *ZSTDCB_createCCtx(int threads, int level, int inputsize)
 
 	ctx->cwork = (cwork_t *) malloc(sizeof(cwork_t) * threads);
 	if (!ctx->cwork)
-		goto err_ctx;
+		goto err_job;
 
 	for (t = 0; t < ctx->threads; t++) {
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
 	}
 
+	ctx->writelist =
+	    (struct writelist *)calloc((size_t)threads, sizeof(struct writelist));
+	if (!ctx->writelist)
+		goto err_cwork;
+
+	for (t = 0; t < ctx->threads; t++) {
+		struct writelist *wl = &ctx->writelist[t];
+		wl->out.buf = 0;
+		wl->out.size = 0;
+		wl->out.allocated = 0;
+		list_add_tail(&wl->node, &ctx->writelist_free);
+	}
+
+	for (t = 0; t < ctx->threads; t++) {
+		cwork_t *w = &ctx->cwork[t];
+		if (pthread_create(&w->pthread, NULL, pt_compress, w) != 0)
+			goto err_threads;
+		started++;
+	}
+
 	return ctx;
 
- err_ctx:
+ err_threads:
+	MTJobControl_shutdown(&ctx->job);
+	while (started-- > 0)
+		pthread_join(ctx->cwork[started].pthread, NULL);
+	free(ctx->writelist);
+ err_cwork:
+	free(ctx->cwork);
+ err_job:
+	MTJobControl_destroy(&ctx->job);
+	pthread_mutex_destroy(&ctx->error_mutex);
+	pthread_mutex_destroy(&ctx->write_mutex);
+	pthread_mutex_destroy(&ctx->read_mutex);
 	free(ctx);
 	return 0;
 }
@@ -197,11 +237,27 @@ static size_t pt_write(ZSTDCB_CCtx * ctx, struct writelist *wl)
 			ctx->outsize += wl->out.size;
 			ctx->curframe++;
 			list_move(entry, &ctx->writelist_free);
+			pthread_cond_signal(&ctx->job.free_cond);
 			goto again;
 		}
 	}
 
 	return 0;
+}
+
+static void reset_writelists(ZSTDCB_CCtx *ctx)
+{
+	pthread_mutex_lock(&ctx->write_mutex);
+	while (!list_empty(&ctx->writelist_busy)) {
+		struct list_head *entry = list_first(&ctx->writelist_busy);
+		list_move(entry, &ctx->writelist_free);
+	}
+	while (!list_empty(&ctx->writelist_done)) {
+		struct list_head *entry = list_first(&ctx->writelist_done);
+		list_move(entry, &ctx->writelist_free);
+	}
+	pthread_cond_broadcast(&ctx->job.free_cond);
+	pthread_mutex_unlock(&ctx->write_mutex);
 }
 
 /* parallel compression worker */
@@ -212,117 +268,154 @@ static void *pt_compress(void *arg)
 	struct writelist *wl;
 	size_t result;
 	ZSTDCB_Buffer in;
+	unsigned generation = 0;
+	ZSTD_CCtx *zctx;
+	const size_t max_out = ZSTD_compressBound(ctx->inputsize) + 12;
 
 	/* inbuf is constant */
 	in.size = ctx->inputsize;
 	in.buf = malloc(in.size);
-	if (!in.buf)
-		return (void *)ZSTDCB_ERROR(memory_allocation);
+	if (!in.buf) {
+		MTJobControl_set_result(&ctx->job,
+					ZSTDCB_ERROR(memory_allocation));
+		return 0;
+	}
+	zctx = ZSTD_createCCtx();
+	if (!zctx) {
+		free(in.buf);
+		MTJobControl_set_result(&ctx->job,
+					ZSTDCB_ERROR(memory_allocation));
+		return 0;
+	}
 
-	for (;;) {
+	while (MTJobControl_wait(&ctx->job, &generation)) {
 		struct list_head *entry;
 		ZSTDCB_Buffer *out;
 		int rv;
+		int failed = 0;
 
-		/* allocate space for new output */
-		pthread_mutex_lock(&ctx->write_mutex);
-		if (!list_empty(&ctx->writelist_free)) {
-			/* take unused entry */
+		for (;;) {
+			wl = 0;
+			result = 0;
+			if (MTJobControl_should_stop(&ctx->job))
+				break;
+
+			/* allocate space for new output */
+			pthread_mutex_lock(&ctx->write_mutex);
+			while (list_empty(&ctx->writelist_free)
+			       && !MTJobControl_should_stop(&ctx->job))
+				pthread_cond_wait(&ctx->job.free_cond,
+						  &ctx->write_mutex);
+			if (list_empty(&ctx->writelist_free)
+			    && MTJobControl_should_stop(&ctx->job)) {
+				pthread_mutex_unlock(&ctx->write_mutex);
+				break;
+			}
 			entry = list_first(&ctx->writelist_free);
 			wl = list_entry(entry, struct writelist, node);
-			wl->out.size = ZSTD_compressBound(ctx->inputsize) + 12;
 			list_move(entry, &ctx->writelist_busy);
-		} else {
-			/* allocate new one */
-			wl = (struct writelist *)
-			    malloc(sizeof(struct writelist));
-			if (!wl) {
-				pthread_mutex_unlock(&ctx->write_mutex);
-				free(in.buf);
-				return (void *)ZSTDCB_ERROR(memory_allocation);
-			}
-			wl->out.size = ZSTD_compressBound(ctx->inputsize) + 12;;
-			wl->out.buf = malloc(wl->out.size);
-			if (!wl->out.buf) {
-				pthread_mutex_unlock(&ctx->write_mutex);
-				free(in.buf);
-				return (void *)ZSTDCB_ERROR(memory_allocation);
-			}
-			list_add(&wl->node, &ctx->writelist_busy);
-		}
-		pthread_mutex_unlock(&ctx->write_mutex);
-		out = &wl->out;
-
-		/* read new input */
-		pthread_mutex_lock(&ctx->read_mutex);
-		in.size = ctx->inputsize;
-		rv = ctx->fn_read(ctx->arg_read, &in);
-		if (rv != 0) {
-			pthread_mutex_unlock(&ctx->read_mutex);
-			result = mt_error(rv);
-			goto error;
-		}
-
-		/* eof */
-		if (in.size == 0 && ctx->frames > 0) {
-			free(in.buf);
-			pthread_mutex_unlock(&ctx->read_mutex);
-
-			pthread_mutex_lock(&ctx->write_mutex);
-			list_move(&wl->node, &ctx->writelist_free);
 			pthread_mutex_unlock(&ctx->write_mutex);
+			out = &wl->out;
 
-			goto okay;
-		}
-		ctx->insize += in.size;
-		wl->frame = ctx->frames++;
-		pthread_mutex_unlock(&ctx->read_mutex);
+			if (out->allocated < max_out) {
+				void *buf = realloc(out->buf, max_out);
+				if (!buf) {
+					result = ZSTDCB_ERROR(memory_allocation);
+					failed = 1;
+					break;
+				}
+				out->buf = buf;
+				out->allocated = max_out;
+			}
+			out->size = max_out;
 
-		/* compress whole frame */
-		{
-			unsigned char *outbuf = out->buf;
-			result =
-			    ZSTD_compress(outbuf + 12, out->size - 12, in.buf,
-					  in.size, ctx->level);
-			if (ZSTD_isError(result)) {
-				zstdmt_errcode = result;
-				result = ZSTDCB_ERROR(compression_library);
-				goto error;
+			/* read new input */
+			pthread_mutex_lock(&ctx->read_mutex);
+			in.size = ctx->inputsize;
+			rv = ctx->fn_read(ctx->arg_read, &in);
+			if (rv != 0) {
+				pthread_mutex_unlock(&ctx->read_mutex);
+				result = mt_error(rv);
+				failed = 1;
+				break;
+			}
+
+			/* eof */
+			if (in.size == 0 && ctx->frames > 0) {
+				pthread_mutex_unlock(&ctx->read_mutex);
+
+				pthread_mutex_lock(&ctx->write_mutex);
+				list_move(&wl->node, &ctx->writelist_free);
+				pthread_cond_signal(&ctx->job.free_cond);
+				pthread_mutex_unlock(&ctx->write_mutex);
+
+				break;
+			}
+			ctx->insize += in.size;
+			wl->frame = ctx->frames++;
+			pthread_mutex_unlock(&ctx->read_mutex);
+
+			/* compress whole frame */
+			{
+				unsigned char *outbuf = out->buf;
+				result =
+				    ZSTD_compressCCtx(zctx, outbuf + 12,
+						      out->size - 12, in.buf,
+						      in.size, ctx->level);
+				if (ZSTD_isError(result)) {
+					zstdmt_errcode = result;
+					result =
+					    ZSTDCB_ERROR
+					    (compression_library);
+					failed = 1;
+					break;
+				}
+			}
+			if (failed)
+				break;
+
+			/* write skippable frame */
+			{
+				unsigned char *outbuf = out->buf;
+
+				MEM_writeLE32(outbuf + 0,
+					      ZSTDCB_MAGIC_SKIPPABLE);
+				MEM_writeLE32(outbuf + 4, 4);
+				MEM_writeLE32(outbuf + 8, (U32) result);
+				out->size = result + 12;
+			}
+
+			/* write result */
+			pthread_mutex_lock(&ctx->write_mutex);
+			result = pt_write(ctx, wl);
+			pthread_mutex_unlock(&ctx->write_mutex);
+			if (ZSTDCB_isError(result)) {
+				failed = 1;
+				break;
 			}
 		}
 
-		/* write skippable frame */
-		{
-			unsigned char *outbuf = out->buf;
-
-			MEM_writeLE32(outbuf + 0, ZSTDCB_MAGIC_SKIPPABLE);
-			MEM_writeLE32(outbuf + 4, 4);
-			MEM_writeLE32(outbuf + 8, (U32) result);
-			out->size = result + 12;
+		if (failed) {
+			if (wl) {
+				pthread_mutex_lock(&ctx->write_mutex);
+				list_move(&wl->node, &ctx->writelist_free);
+				pthread_cond_signal(&ctx->job.free_cond);
+				pthread_mutex_unlock(&ctx->write_mutex);
+			}
+			MTJobControl_set_result(&ctx->job, result);
 		}
-
-		/* write result */
-		pthread_mutex_lock(&ctx->write_mutex);
-		result = pt_write(ctx, wl);
-		pthread_mutex_unlock(&ctx->write_mutex);
-		if (ZSTDCB_isError(result))
-			goto error;
+		MTJobControl_finish_worker(&ctx->job);
 	}
 
- okay:
+	ZSTD_freeCCtx(zctx);
+	free(in.buf);
 	return 0;
- error:
-	pthread_mutex_lock(&ctx->write_mutex);
-	list_move(&wl->node, &ctx->writelist_free);
-	pthread_mutex_unlock(&ctx->write_mutex);
-	return (void *)result;
 }
 
 /* compress data, until input ends */
 size_t ZSTDCB_compressCCtx(ZSTDCB_CCtx * ctx, ZSTDCB_RdWr_t * rdwr)
 {
-	int t;
-	void *retval_of_thread = 0;
+	size_t result;
 
 	if (!ctx)
 		return ZSTDCB_ERROR(init_missing);
@@ -339,56 +432,11 @@ size_t ZSTDCB_compressCCtx(ZSTDCB_CCtx * ctx, ZSTDCB_RdWr_t * rdwr)
 	ctx->frames = 0;
 	ctx->curframe = 0;
 	ctx->zstdmt_errcode = 0;
+	MTJobControl_start(&ctx->job, ctx->threads);
+	result = MTJobControl_wait_done(&ctx->job);
+	reset_writelists(ctx);
 
-	/* start all workers */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *w = &ctx->cwork[t];
-		pthread_create(&w->pthread, NULL, pt_compress, w);
-	}
-
-	/* wait for all workers */
-	for (t = 0; t < ctx->threads; t++) {
-		cwork_t *w = &ctx->cwork[t];
-		void *p = 0;
-		pthread_join(w->pthread, &p);
-		if (p)
-			retval_of_thread = p;
-	}
-
-	/* clean up the free list */
-	while (!list_empty(&ctx->writelist_free)) {
-		struct writelist *wl;
-		struct list_head *entry;
-		entry = list_first(&ctx->writelist_free);
-		wl = list_entry(entry, struct writelist, node);
-		free(wl->out.buf);
-		list_del(&wl->node);
-		free(wl);
-	}
-
-	/* on error, these two lists may have some entries */
-	if (retval_of_thread) {
-		struct writelist *wl;
-		struct list_head *entry;
-
-		while (!list_empty(&ctx->writelist_busy)) {
-			entry = list_first(&ctx->writelist_busy);
-			wl = list_entry(entry, struct writelist, node);
-			free(wl->out.buf);
-			list_del(&wl->node);
-			free(wl);
-		}
-
-		while (!list_empty(&ctx->writelist_done)) {
-			entry = list_first(&ctx->writelist_done);
-			wl = list_entry(entry, struct writelist, node);
-			free(wl->out.buf);
-			list_del(&wl->node);
-			free(wl);
-		}
-	}
-
-	return (size_t) retval_of_thread;
+	return result;
 }
 
 /* returns current uncompressed data size */
@@ -424,9 +472,21 @@ size_t ZSTDCB_GetFramesCCtx(ZSTDCB_CCtx * ctx)
 /* free all allocated buffers and structures */
 void ZSTDCB_freeCCtx(ZSTDCB_CCtx * ctx)
 {
+	int t;
+
 	if (!ctx)
 		return;
 
+	MTJobControl_shutdown(&ctx->job);
+	for (t = 0; t < ctx->threads; t++)
+		pthread_join(ctx->cwork[t].pthread, NULL);
+	for (t = 0; t < ctx->threads; t++)
+		free(ctx->writelist[t].out.buf);
+	free(ctx->writelist);
+	MTJobControl_destroy(&ctx->job);
+	pthread_mutex_destroy(&ctx->error_mutex);
+	pthread_mutex_destroy(&ctx->write_mutex);
+	pthread_mutex_destroy(&ctx->read_mutex);
 	free(ctx->cwork);
 	free(ctx);
 	ctx = 0;

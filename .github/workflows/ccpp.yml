@@ -1,15 +1,232 @@
-name: C/C++ CI
+name: Build And Release
 
 on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-linux-x86_64
+            archive_ext: tar.gz
+            extension: ""
+            cross: ""
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: ""
+            packages: ""
+            run_tests: true
+          - name: linux-x86
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-linux-x86
+            archive_ext: tar.gz
+            extension: ""
+            cross: ""
+            cc: "gcc -m32"
+            cflags: "-W -pthread -Wall -pipe -fomit-frame-pointer -Wno-implicit-fallthrough -O3 -m32"
+            ldflags: "-m32 -lpthread"
+            win_ldflags: ""
+            packages: "gcc-multilib libc6-dev-i386"
+            run_tests: false
+          - name: linux-arm64
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-linux-arm64
+            archive_ext: tar.gz
+            extension: ""
+            cross: "aarch64-linux-gnu-"
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: ""
+            packages: "gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross"
+            run_tests: false
+          - name: linux-armv7
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-linux-armv7
+            archive_ext: tar.gz
+            extension: ""
+            cross: "arm-linux-gnueabihf-"
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: ""
+            packages: "gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-dev-armhf-cross"
+            run_tests: false
+          - name: windows-x86_64
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-windows-x86_64
+            archive_ext: zip
+            extension: ".exe"
+            cross: "x86_64-w64-mingw32-"
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: "-static -lwinmm -lpsapi"
+            packages: "gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 zip"
+            run_tests: false
+          - name: windows-x86
+            runs_on: ubuntu-22.04
+            archive_name: zstdmt-windows-x86
+            archive_ext: zip
+            extension: ".exe"
+            cross: "i686-w64-mingw32-"
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: "-static -lwinmm -lpsapi"
+            packages: "gcc-mingw-w64-i686-posix binutils-mingw-w64-i686 zip"
+            run_tests: false
+          - name: macos-x86_64
+            runs_on: macos-13
+            archive_name: zstdmt-macos-x86_64
+            archive_ext: tar.gz
+            extension: ""
+            cross: ""
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: ""
+            packages: ""
+            run_tests: false
+          - name: macos-arm64
+            runs_on: macos-14
+            archive_name: zstdmt-macos-arm64
+            archive_ext: tar.gz
+            extension: ""
+            cross: ""
+            cc: ""
+            cflags: ""
+            ldflags: ""
+            win_ldflags: ""
+            packages: ""
+            run_tests: false
 
     steps:
-    - uses: actions/checkout@v3
-    - name: programs
-      run: cd programs && make && make tests
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        if: runner.os == 'Linux' && matrix.packages != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Build programs
+        shell: bash
+        env:
+          CROSS: ${{ matrix.cross }}
+          CC_OVERRIDE: ${{ matrix.cc }}
+          CFLAGS_OVERRIDE: ${{ matrix.cflags }}
+          EXTENSION_OVERRIDE: ${{ matrix.extension }}
+          LDFLAGS_OVERRIDE: ${{ matrix.ldflags }}
+          WIN_LDFLAGS_OVERRIDE: ${{ matrix.win_ldflags }}
+        run: |
+          set -euo pipefail
+          args=()
+          [ -n "${CROSS:-}" ] && args+=("CROSS=${CROSS}")
+          [ -n "${CC_OVERRIDE:-}" ] && args+=("CC=${CC_OVERRIDE}")
+          [ -n "${CFLAGS_OVERRIDE:-}" ] && args+=("CFLAGS=${CFLAGS_OVERRIDE}")
+          [ -n "${EXTENSION_OVERRIDE:-}" ] && args+=("EXTENSION=${EXTENSION_OVERRIDE}")
+          [ -n "${LDFLAGS_OVERRIDE:-}" ] && args+=("LDFLAGS=${LDFLAGS_OVERRIDE}")
+          [ -n "${WIN_LDFLAGS_OVERRIDE:-}" ] && args+=("WIN_LDFLAGS=${WIN_LDFLAGS_OVERRIDE}")
+          make -C programs "${args[@]}" again
+
+      - name: Run tests
+        if: matrix.run_tests
+        shell: bash
+        run: make -C programs tests
+
+      - name: Package release archive
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          BIN_EXT: ${{ matrix.extension }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/${ARCHIVE_NAME}/bin
+          cp LICENSE README.md CHANGES.md dist/${ARCHIVE_NAME}/
+          for bin in brotli-mt lizard-mt lz4-mt lz5-mt zstd-mt snappy-mt lzfse-mt; do
+            cp "programs/${bin}${BIN_EXT}" "dist/${ARCHIVE_NAME}/bin/"
+          done
+          if [ "${ARCHIVE_EXT}" = "zip" ]; then
+            (
+              cd dist
+              zip -rq "${ARCHIVE_NAME}.zip" "${ARCHIVE_NAME}"
+            )
+          else
+            tar -C dist -czf "dist/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          fi
+          shasum -a 256 "dist/${ARCHIVE_NAME}.${ARCHIVE_EXT}" > "dist/${ARCHIVE_NAME}.${ARCHIVE_EXT}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_name }}
+          path: |
+            dist/${{ matrix.archive_name }}.${{ matrix.archive_ext }}
+            dist/${{ matrix.archive_name }}.${{ matrix.archive_ext }}.sha256
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push'
+    name: Release
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-artifacts/*)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+
+          short_sha="${GITHUB_SHA::7}"
+          tag="build-${GITHUB_SHA}"
+          title="Build ${short_sha}"
+          notes="Automated multi-platform build for commit ${GITHUB_SHA} from ${GITHUB_REF_NAME}."
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --clobber
+          else
+            gh release create "${tag}" "${assets[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "${title}" \
+              --notes "${notes}" \
+              --prerelease
+          fi
