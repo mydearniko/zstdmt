@@ -1,4 +1,11 @@
 /dist/
+/programs/brotli/
+/programs/lizard/
+/programs/lz4/
+/programs/lz5/
+/programs/lzfse/
+/programs/snappy/
+/programs/zstd/
 /programs/*-mt
 /programs/*-mt.exe
 /programs/un*-mt

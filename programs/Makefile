@@ -64,7 +64,7 @@ ZSTDMTDIR = ../lib
 COMMON	= platform.c $(ZSTDMTDIR)/threading.c
 
 BRO_MT	= $(COMMON) $(ZSTDMTDIR)/brotli-mt_common.c $(ZSTDMTDIR)/brotli-mt_compress.c \
-	  $(ZSTDMTDIR)/brotli-mt_decompress.c brotli-mt.c
+	  $(ZSTDMTDIR)/brotli-mt_decompress.c $(ZSTDMTDIR)/brotli-reset.c brotli-mt.c
 LIZ_MT	= $(COMMON) $(ZSTDMTDIR)/lizard-mt_common.c $(ZSTDMTDIR)/lizard-mt_compress.c \
 	  $(ZSTDMTDIR)/lizard-mt_decompress.c lizard-mt.c
 LZ4_MT	= $(COMMON) $(ZSTDMTDIR)/lz4-mt_common.c $(ZSTDMTDIR)/lz4-mt_compress.c \
