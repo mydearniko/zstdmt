@@ -201,7 +201,10 @@ jobs:
           else
             tar -C dist -czf "dist/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
           fi
-          shasum -a 256 "dist/${ARCHIVE_NAME}.${ARCHIVE_EXT}" > "dist/${ARCHIVE_NAME}.${ARCHIVE_EXT}.sha256"
+          (
+            cd dist
+            shasum -a 256 "${ARCHIVE_NAME}.${ARCHIVE_EXT}" > "${ARCHIVE_NAME}.${ARCHIVE_EXT}.sha256"
+          )
 
       - uses: actions/upload-artifact@v4
         with:

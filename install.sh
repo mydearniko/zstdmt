@@ -35,6 +35,7 @@ PREFIX="${DEFAULT_PREFIX}"
 ACTION="install"
 TAG_OVERRIDE=""
 SUDO=()
+DOWNLOAD_PACKAGE_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -197,12 +198,15 @@ fetch_file() {
 }
 
 verify_checksum() {
-  local workdir="$1" checksum_file="$2"
+  local workdir="$1" archive_file="$2" checksum_file="$3" normalized_checksum
+
+  normalized_checksum="${workdir}/${archive_file}.sha256.check"
+  sed "s#  .*#  ${archive_file}#" "${workdir}/${checksum_file}" > "${normalized_checksum}"
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "${workdir}" && sha256sum -c "${checksum_file}" >&2)
+    (cd "${workdir}" && sha256sum -c "$(basename "${normalized_checksum}")" >&2)
   elif command -v shasum >/dev/null 2>&1; then
-    (cd "${workdir}" && shasum -a 256 -c "${checksum_file}" >&2)
+    (cd "${workdir}" && shasum -a 256 -c "$(basename "${normalized_checksum}")" >&2)
   else
     die "missing checksum tool: need sha256sum or shasum"
   fi
@@ -279,7 +283,7 @@ read_installed_tag() {
 }
 
 download_and_extract_release() {
-  local release_tag="$1" tmpdir archive_url checksum_url extract_dir package_dir bin
+  local release_tag="$1" archive_url checksum_url extract_dir package_dir bin
 
   TMPDIR_RELEASE="$(mktemp -d)"
   trap 'rm -rf "${TMPDIR_RELEASE}"' EXIT
@@ -290,7 +294,7 @@ download_and_extract_release() {
   log "Downloading ${ARCHIVE_FILE} from ${REPO} ${release_tag}"
   fetch_file "${archive_url}" "${TMPDIR_RELEASE}/${ARCHIVE_FILE}"
   fetch_file "${checksum_url}" "${TMPDIR_RELEASE}/${ARCHIVE_FILE}.sha256"
-  verify_checksum "${TMPDIR_RELEASE}" "${ARCHIVE_FILE}.sha256"
+  verify_checksum "${TMPDIR_RELEASE}" "${ARCHIVE_FILE}" "${ARCHIVE_FILE}.sha256"
 
   extract_dir="${TMPDIR_RELEASE}/extract"
   mkdir -p "${extract_dir}"
@@ -302,7 +306,7 @@ download_and_extract_release() {
     [ -f "${package_dir}/bin/${bin}" ] || die "release archive is missing ${bin}"
   done
 
-  printf '%s\n' "${package_dir}"
+  DOWNLOAD_PACKAGE_DIR="${package_dir}"
 }
 
 perform_install() {
@@ -317,7 +321,8 @@ perform_install() {
   fi
 
   previous_tag="$(read_installed_tag || true)"
-  package_dir="$(download_and_extract_release "${release_tag}")"
+  download_and_extract_release "${release_tag}"
+  package_dir="${DOWNLOAD_PACKAGE_DIR}"
   release_dir="${ROOT_DIR}/releases/${release_tag}"
 
   setup_privileges

@@ -13,7 +13,7 @@
 - install the latest published release on Linux or macOS with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mydearniko/zstdmt/main/install.sh | bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/mydearniko/zstdmt/master/install.sh | bash -s -- install
 ```
 
 - update an existing install with `bash install.sh update`
