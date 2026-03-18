@@ -27,6 +27,100 @@
 #include <process.h>
 #include <errno.h>
 
+int pthread_cond_init(pthread_cond_t *cond, const void *unused)
+{
+	(void)unused;
+
+	cond->waiters_count = 0;
+	cond->was_broadcast = 0;
+	InitializeCriticalSection(&cond->waiters_count_lock);
+
+	cond->semaphore = CreateSemaphore(NULL, 0, 0x7fffffff, NULL);
+	if (cond->semaphore == NULL) {
+		DeleteCriticalSection(&cond->waiters_count_lock);
+		return (int)GetLastError();
+	}
+
+	cond->waiters_done = CreateEvent(NULL, FALSE, FALSE, NULL);
+	if (cond->waiters_done == NULL) {
+		CloseHandle(cond->semaphore);
+		DeleteCriticalSection(&cond->waiters_count_lock);
+		return (int)GetLastError();
+	}
+
+	return 0;
+}
+
+int pthread_cond_destroy(pthread_cond_t *cond)
+{
+	CloseHandle(cond->waiters_done);
+	CloseHandle(cond->semaphore);
+	DeleteCriticalSection(&cond->waiters_count_lock);
+	return 0;
+}
+
+int pthread_cond_signal(pthread_cond_t *cond)
+{
+	int have_waiters;
+
+	EnterCriticalSection(&cond->waiters_count_lock);
+	have_waiters = (cond->waiters_count > 0);
+	LeaveCriticalSection(&cond->waiters_count_lock);
+
+	if (have_waiters)
+		ReleaseSemaphore(cond->semaphore, 1, NULL);
+
+	return 0;
+}
+
+int pthread_cond_broadcast(pthread_cond_t *cond)
+{
+	int have_waiters;
+	LONG waiters_to_release;
+
+	EnterCriticalSection(&cond->waiters_count_lock);
+	have_waiters = (cond->waiters_count > 0);
+	waiters_to_release = (LONG)cond->waiters_count;
+	if (have_waiters)
+		cond->was_broadcast = 1;
+	LeaveCriticalSection(&cond->waiters_count_lock);
+
+	if (!have_waiters)
+		return 0;
+
+	ReleaseSemaphore(cond->semaphore, waiters_to_release, NULL);
+	WaitForSingleObject(cond->waiters_done, INFINITE);
+
+	EnterCriticalSection(&cond->waiters_count_lock);
+	cond->was_broadcast = 0;
+	LeaveCriticalSection(&cond->waiters_count_lock);
+
+	return 0;
+}
+
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+	int last_waiter;
+
+	EnterCriticalSection(&cond->waiters_count_lock);
+	cond->waiters_count++;
+	LeaveCriticalSection(&cond->waiters_count_lock);
+
+	LeaveCriticalSection(mutex);
+	WaitForSingleObject(cond->semaphore, INFINITE);
+
+	EnterCriticalSection(&cond->waiters_count_lock);
+	cond->waiters_count--;
+	last_waiter = cond->was_broadcast && cond->waiters_count == 0;
+	LeaveCriticalSection(&cond->waiters_count_lock);
+
+	if (last_waiter)
+		SetEvent(cond->waiters_done);
+
+	EnterCriticalSection(mutex);
+	return 0;
+}
+
 static unsigned __stdcall worker(void *arg)
 {
 	pthread_t *thread = (pthread_t *) arg;

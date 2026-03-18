@@ -25,22 +25,10 @@ extern "C" {
  * http://www.cse.wustl.edu/~schmidt/win32-cv-1.html
  */
 
-#ifndef WINVER
-#define WINVER 0x0600
-#endif
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-
-static inline int pthread_cond_init_win(CONDITION_VARIABLE *cond)
-{
-	InitializeConditionVariable(cond);
-	return 0;
-}
 
 /* mutex */
 #define pthread_mutex_t CRITICAL_SECTION
@@ -50,12 +38,19 @@ static inline int pthread_cond_init_win(CONDITION_VARIABLE *cond)
 #define pthread_mutex_unlock      LeaveCriticalSection
 
 /* condition variables */
-#define pthread_cond_t CONDITION_VARIABLE
-#define pthread_cond_init(a,b)    pthread_cond_init_win((a))
-#define pthread_cond_destroy(a)   ((void)0)
-#define pthread_cond_signal       WakeConditionVariable
-#define pthread_cond_broadcast    WakeAllConditionVariable
-#define pthread_cond_wait(a,b)    (SleepConditionVariableCS((a), (b), INFINITE) ? 0 : -1)
+typedef struct {
+	int waiters_count;
+	int was_broadcast;
+	CRITICAL_SECTION waiters_count_lock;
+	HANDLE semaphore;
+	HANDLE waiters_done;
+} pthread_cond_t;
+
+extern int pthread_cond_init(pthread_cond_t *cond, const void *unused);
+extern int pthread_cond_destroy(pthread_cond_t *cond);
+extern int pthread_cond_signal(pthread_cond_t *cond);
+extern int pthread_cond_broadcast(pthread_cond_t *cond);
+extern int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
 
 /* pthread_create() and pthread_join() */
 typedef struct {
