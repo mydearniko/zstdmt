@@ -238,6 +238,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
           RELEASE_TITLE_INPUT: ${{ inputs.release_title }}
           PRERELEASE_INPUT: ${{ inputs.prerelease }}
@@ -272,11 +273,12 @@ jobs:
             create_flags+=(--prerelease --latest=false)
           fi
 
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${assets[@]}" --clobber
-            gh release edit "${tag}" --title "${title}" --notes "${notes}" "${edit_flags[@]}"
+          if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --repo "${GH_REPO}" --clobber
+            gh release edit "${tag}" --repo "${GH_REPO}" --title "${title}" --notes "${notes}" "${edit_flags[@]}"
           else
             gh release create "${tag}" "${assets[@]}" \
+              --repo "${GH_REPO}" \
               --title "${title}" \
               --notes "${notes}" \
               "${create_flags[@]}"
