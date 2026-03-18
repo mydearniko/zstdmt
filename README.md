@@ -6,6 +6,20 @@
 - brotli is supported the same way, it will encapsulate the real brotli stream
   within an 16 byte frame header
 
+## Prebuilt Binaries
+
+- GitHub Actions can now be started manually from the Actions tab.
+- Manual runs can publish a release that `install.sh` can consume, and push runs still publish build artifacts.
+- install the latest published release on Linux or macOS with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mydearniko/zstdmt/main/install.sh | bash -s -- install
+```
+
+- update an existing install with `bash install.sh update`
+- remove it again with `bash install.sh remove`
+- use `--prefix "$HOME/.local"` for a user-local install or `--tag <tag>` to pin a specific release
+
 ## Generic skippable frame definition
 
 - the frame header for [Lizard], [LZ4], [LZ5] and [Zstandard] is like this:
