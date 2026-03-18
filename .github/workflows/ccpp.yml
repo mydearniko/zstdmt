@@ -55,7 +55,7 @@ jobs:
             extension: ""
             cross: ""
             cc: "gcc -m32"
-            cflags: "-W -pthread -Wall -pipe -fomit-frame-pointer -Wno-implicit-fallthrough -O3 -m32"
+            cflags: "-m32"
             ldflags: "-m32 -lpthread"
             win_ldflags: ""
             packages: "gcc-multilib libc6-dev-i386"
@@ -149,20 +149,31 @@ jobs:
         env:
           CROSS: ${{ matrix.cross }}
           CC_OVERRIDE: ${{ matrix.cc }}
-          CFLAGS_OVERRIDE: ${{ matrix.cflags }}
+          EXTRA_CFLAGS_OVERRIDE: ${{ matrix.cflags }}
           EXTENSION_OVERRIDE: ${{ matrix.extension }}
           LDFLAGS_OVERRIDE: ${{ matrix.ldflags }}
           WIN_LDFLAGS_OVERRIDE: ${{ matrix.win_ldflags }}
         run: |
           set -euo pipefail
           args=()
+          has_args=0
           [ -n "${CROSS:-}" ] && args+=("CROSS=${CROSS}")
+          [ -n "${CROSS:-}" ] && has_args=1
           [ -n "${CC_OVERRIDE:-}" ] && args+=("CC=${CC_OVERRIDE}")
-          [ -n "${CFLAGS_OVERRIDE:-}" ] && args+=("CFLAGS=${CFLAGS_OVERRIDE}")
+          [ -n "${CC_OVERRIDE:-}" ] && has_args=1
+          [ -n "${EXTRA_CFLAGS_OVERRIDE:-}" ] && args+=("EXTRA_CFLAGS=${EXTRA_CFLAGS_OVERRIDE}")
+          [ -n "${EXTRA_CFLAGS_OVERRIDE:-}" ] && has_args=1
           [ -n "${EXTENSION_OVERRIDE:-}" ] && args+=("EXTENSION=${EXTENSION_OVERRIDE}")
+          [ -n "${EXTENSION_OVERRIDE:-}" ] && has_args=1
           [ -n "${LDFLAGS_OVERRIDE:-}" ] && args+=("LDFLAGS=${LDFLAGS_OVERRIDE}")
+          [ -n "${LDFLAGS_OVERRIDE:-}" ] && has_args=1
           [ -n "${WIN_LDFLAGS_OVERRIDE:-}" ] && args+=("WIN_LDFLAGS=${WIN_LDFLAGS_OVERRIDE}")
-          make -C programs "${args[@]}" again
+          [ -n "${WIN_LDFLAGS_OVERRIDE:-}" ] && has_args=1
+          if [ "${has_args}" -eq 1 ]; then
+            make -C programs "${args[@]}" again
+          else
+            make -C programs again
+          fi
 
       - name: Run tests
         if: matrix.run_tests

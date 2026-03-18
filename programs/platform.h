@@ -39,6 +39,12 @@ extern int getcpucount(void);
 #if defined(_MSC_VER) || defined(__MINGW32__)
 
 /* Windows */
+# ifndef WINVER
+# define WINVER 0x0600
+# endif
+# ifndef _WIN32_WINNT
+# define _WIN32_WINNT 0x0600
+# endif
 #include <windows.h>
 #include <processthreadsapi.h> /* GetProcessTimes() */
 #include <timezoneapi.h> /* FileTimeToSystemTime() */

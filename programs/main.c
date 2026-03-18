@@ -81,9 +81,8 @@ static void panic(const char *msg)
 
 static void version(int quit)
 {
-	printf(" %s using libzstdmt v0.8, using %s %s"
+	printf("\n %s using libzstdmt v0.8, using %s %s"
 		"\n Copyright (c) 2016 - 2024 Tino Reichardt",
-		"\n",
 		progname, METHOD, VERSION);
 
 	if (quit)

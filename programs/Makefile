@@ -38,6 +38,7 @@ CFLAGS	= -W -pthread -Wall -pipe
 CFLAGS	+= -fomit-frame-pointer
 CFLAGS	+= -Wno-implicit-fallthrough
 CFLAGS	+= -O3
+CFLAGS	+= $(EXTRA_CFLAGS)
 #CFLAGS	+= -flto
 #CFLAGS += -DDEBUGME
 #CFLAGS += -g

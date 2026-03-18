@@ -25,10 +25,22 @@ extern "C" {
  * http://www.cse.wustl.edu/~schmidt/win32-cv-1.html
  */
 
+#ifndef WINVER
+#define WINVER 0x0600
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+static inline int pthread_cond_init_win(CONDITION_VARIABLE *cond)
+{
+	InitializeConditionVariable(cond);
+	return 0;
+}
 
 /* mutex */
 #define pthread_mutex_t CRITICAL_SECTION
@@ -39,7 +51,7 @@ extern "C" {
 
 /* condition variables */
 #define pthread_cond_t CONDITION_VARIABLE
-#define pthread_cond_init(a,b)    (InitializeConditionVariable((a)), 0)
+#define pthread_cond_init(a,b)    pthread_cond_init_win((a))
 #define pthread_cond_destroy(a)   ((void)0)
 #define pthread_cond_signal       WakeConditionVariable
 #define pthread_cond_broadcast    WakeAllConditionVariable
